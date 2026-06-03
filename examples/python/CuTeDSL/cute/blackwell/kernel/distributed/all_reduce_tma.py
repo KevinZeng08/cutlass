@@ -62,8 +62,9 @@ To run this example:
 
 .. code-block:: bash
 
-    torchrun --nproc-per-node 8 examples/distributed/all_reduce_tma.py --shape 1024,1024
-    torchrun --nproc-per-node 8 examples/distributed/all_reduce_tma.py --shape 4,6,8,10,12
+    torchrun --nproc-per-node 8 examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_tma.py --M 1024 --N 1024
+    torchrun --nproc-per-node 8 examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_tma.py \
+        --M 8192 --N 8192 --benchmark --warmup_iterations 10 --iterations 50
 """
 
 import cutlass
@@ -487,6 +488,7 @@ except ImportError:
 from cuda.pathfinder import load_nvidia_dynamic_lib
 
 from cutlass.cute.runtime import from_dlpack
+import cutlass.cute.testing as testing
 
 try:
     import nvshmem.core
@@ -541,14 +543,20 @@ def torchrun_finalize():
 
 def run_all_reduce_tma(
     shape: tuple,
+    warmup_iterations: int = 2,
+    iterations: int = 10,
     skip_ref_check: bool = False,
+    benchmark: bool = False,
 ):
     """
     Run the TMA-based All-Reduce kernel.
 
     Args:
-        shape: Tensor shape tuple, e.g., (4, 6, 8, 10)
+        shape: Tensor shape tuple, (M, N)
+        warmup_iterations: Number of warmup iterations for benchmarking
+        iterations: Number of timed iterations for benchmarking
         skip_ref_check: If True, skip reference result verification
+        benchmark: If True, run the performance benchmark after the ref check
     """
     local_rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -649,40 +657,106 @@ def run_all_reduce_tma(
     nvshmem.core.free_tensor(local_output_tensor)
     nvshmem.core.free_tensor(local_flag)
 
+    if not benchmark:
+        return
 
-def parse_shape(shape_str: str) -> tuple:
-    """
-    Parse shape string into tuple.
-    Examples:
-        "1024,1024" -> (1024, 1024)
-        "2,3,4,5,6,7,8" -> (2, 3, 4, 5, 6, 7, 8)
-    """
-    return tuple(int(x.strip()) for x in shape_str.split(","))
+    # Benchmark with rotating workspaces (mirrors the other all-reduce examples).
+    free_func_and_tensor_pairs = []
+
+    def add_free_func_and_tensor(free_func, tensor):
+        free_func_and_tensor_pairs.append((free_func, tensor))
+
+    def generate_tensors():
+        local_input = nvshmem.core.tensor(shape, dtype=torch.float32)
+        local_input.random_(0, 100)
+        peer_inputs = [
+            nvshmem.core.get_peer_tensor(local_input, r) for r in range(world_size)
+        ]
+        local_output = nvshmem.core.tensor(shape, dtype=torch.float32)
+        local_output.fill_(0)
+        output_mc = nvshmem.core.get_multicast_tensor(
+            nvshmem.core.Teams.TEAM_NODE, local_output
+        )
+        flag = nvshmem.core.tensor((ctas_per_rank,), dtype=torch.int32)
+        flag.fill_(0)
+        flag_multicast = nvshmem.core.get_multicast_tensor(
+            nvshmem.core.Teams.TEAM_NODE, flag
+        )
+
+        ja = testing.JitArguments(
+            [from_dlpack(t) for t in peer_inputs],
+            from_dlpack(output_mc),
+            from_dlpack(flag),
+            from_dlpack(flag_multicast),
+        )
+
+        for i in range(world_size):
+            if i != local_rank:
+                add_free_func_and_tensor(nvshmem.core.free_tensor, peer_inputs[i])
+        add_free_func_and_tensor(nvshmem.core.free_tensor, output_mc)
+        add_free_func_and_tensor(nvshmem.core.free_tensor, flag_multicast)
+        add_free_func_and_tensor(nvshmem.core.free_tensor, local_input)
+        add_free_func_and_tensor(nvshmem.core.free_tensor, local_output)
+        add_free_func_and_tensor(nvshmem.core.free_tensor, flag)
+        return ja
+
+    avg_time_us = testing.benchmark(
+        compiled_func,
+        workspace_generator=generate_tensors,
+        workspace_count=10,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
+
+    if local_rank == 0:
+        print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
+        print(
+            f"Achieved memory throughput: {((world_size + 1) * total_elems * 32 // 8) / (avg_time_us / 1e6) / 1e9:.2f} GB/s"
+        )
+
+    for free_func, tensor in free_func_and_tensor_pairs:
+        free_func(tensor)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="TMA-based distributed all-reduce example"
     )
-    parser.add_argument(
-        "--shape",
-        default="1024,1024",
-        type=str,
-        help="Tensor shape as comma-separated values, e.g., '1024,1024' or 4,6,8,10,12'",
-    )
+    parser.add_argument("--M", default=1024, type=int)
+    parser.add_argument("--N", default=1024, type=int)
     parser.add_argument(
         "--skip_ref_check",
         action="store_true",
         help="Skip reference result verification",
     )
+    parser.add_argument(
+        "--warmup_iterations",
+        default=2,
+        type=int,
+        help="Number of warmup iterations for benchmarking",
+    )
+    parser.add_argument(
+        "--iterations",
+        default=10,
+        type=int,
+        help="Number of timed iterations for benchmarking",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run the performance benchmark after the reference check",
+    )
 
     args = parser.parse_args()
-    shape = parse_shape(args.shape)
+    shape = (args.M, args.N)
 
     torchrun_uid_init_bcast()
     run_all_reduce_tma(
         shape=shape,
+        warmup_iterations=args.warmup_iterations,
+        iterations=args.iterations,
         skip_ref_check=args.skip_ref_check,
+        benchmark=args.benchmark,
     )
     torchrun_finalize()
 

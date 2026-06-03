@@ -89,9 +89,9 @@ To run this example:
 
 .. code-block:: bash
 
-    torchrun --nproc-per-node 8  examples/distributed/all_reduce_two_shot_multimem.py --M 1024 --N 512
-    torchrun --nproc-per-node 8  examples/distributed/all_reduce_two_shot_multimem.py \
-        --M 1024 --N 1024 --benchmark --warmup_iterations 2 --iterations 100
+    torchrun --nproc-per-node 8  examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_two_shot_multimem.py --M 1024 --N 512
+    torchrun --nproc-per-node 8  examples/python/CuTeDSL/cute/blackwell/kernel/distributed/all_reduce_two_shot_multimem.py \
+        --M 8192 --N 8192 --benchmark --warmup_iterations 10 --iterations 50
 """
 
 
